@@ -165,8 +165,16 @@ def accumulate_weighted(frames, flows, idx, radius=3, sigma=0.04):
     S_ = np.stack(st).astype(np.float32)
     med = np.median(S_, 0)
     res = np.abs(S_ - med).mean(-1)
-    w = np.exp(-(res / (2 * sigma)) ** 2)
-    return np.clip((S_ * w[..., None]).sum(0) / (w.sum(0)[..., None] + 1e-6), 0, 1).astype(np.float32)
+    # 权重尺度不能小于实际残差：干净视频（σ 估计到 1/255）时 exp(-(res/2σ)²) 会全部塌成 0，
+    # 归一化就变成 0/0，出现黑点。用残差中位数兜底。
+    sig_w = max(float(sigma), float(np.median(res)), 1e-3)
+    w = np.exp(-(res / (2 * sig_w)) ** 2)
+    sw = w.sum(0)
+    merged = (S_ * w[..., None]).sum(0) / np.maximum(sw, 1e-6)[..., None]
+    bad = sw < 1e-6                       # 权重全灭的像素退回普通平均
+    if np.any(bad):
+        merged[bad] = S_.mean(0)[bad]
+    return np.clip(merged, 0, 1).astype(np.float32)
 
 
 # --------------------------------------------------------------- 独立入口
