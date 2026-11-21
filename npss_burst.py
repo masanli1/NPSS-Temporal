@@ -280,3 +280,50 @@ def bm_flow_pyramid(a, b, B=8):
     b1 = warp(b, u0, v0)
     u1, v1 = bm_flow(a, b1, B=B, R=6, scale=1)
     return u0 + u1, v0 + v1
+
+# ------------------------------------------------- continuous temporal denoise
+def denoise_sequence(frames, radius=3, sigma=None, flows=None, polish=False):
+    """Denoise a whole sequence **continuously**: every output frame uses its temporal
+    neighbours (radius frames before and after), accumulating along their motion
+    trajectories. This is the time-series complement, not a burst-to-one-still fusion:
+    the output has the same number of frames as the input.
+
+    edges shrink the window automatically (`radius` is clamped per frame).
+    Returns `(out_frames, info)`.
+    """
+    frames = np.asarray(frames, np.float32)
+    n = len(frames)
+    if n == 0:
+        raise ValueError("empty sequence")
+    if sigma is None:
+        mid = frames[n // 2]
+        y = M.luma(mid)
+        sigma = float(np.median(np.abs(y - M.gaussian_blur(y, 1.2))) / 0.6745)
+    sigma = max(float(sigma), 1e-4)
+    if flows is None:
+        flows = [bm_flow_pyramid(frames[i], frames[i + 1]) for i in range(n - 1)]
+    out = np.empty_like(frames)
+    for i in range(n):
+        out[i] = accumulate_weighted(frames, flows, i, min(radius, max(i, n - 1 - i)), sigma)
+        if polish and M is not None:
+            d, _ = M.denoise(out[i], sigma=float(sigma) / np.sqrt(2 * min(radius, max(i, n - 1 - i)) + 1))
+            out[i] = np.clip(d, 0, 1)
+    return out, {"frames": n, "radius": int(radius), "sigma": float(sigma)}
+
+
+# ------------------------------------------------------------------ video out
+def write_video(path, frames, fps=30, crf=18):
+    """Write float frames (N,H,W,3) to an H.264 mp4 via ffmpeg."""
+    ff = find_ffmpeg()
+    n, h, w = frames.shape[:3]
+    cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
+           "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p", path]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    try:
+        for f in frames:
+            p.stdin.write((np.clip(f, 0, 1) * 255 + 0.5).astype(np.uint8).tobytes())
+        p.stdin.close()
+    finally:
+        p.wait()
+    return path

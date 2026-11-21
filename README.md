@@ -1,10 +1,10 @@
-# NPSS-Burst
+# NPSS-Temporal
 
 Author: [masanli1](https://github.com/masanli1) · Repository: [NPSS-Burst](https://github.com/masanli1/NPSS-Burst)
 
 [中文说明](README.zh-CN.md)
 
-> **Fuse a burst of consecutive frames into one clean photo.**
+> **Denoise a video continuously by complementing each frame with its temporal neighbours.**
 > Consecutive frames are *complementary*: same scene, independent noise. Align them and the
 > noise averages down by √N while the detail stays — something no single-frame denoiser can do.
 
@@ -15,13 +15,16 @@ Pure numpy for the core; ffmpeg only to pull frames out of a video.
 Extracted from NPSS-Enhancer's `GUI/traj_denoise.py` (trajectory accumulation):
 
 ```
-N consecutive frames
+video frames (continuous)
   ↓  block-matching flow between consecutive frames (coarse-to-fine pyramid)
-  ↓  chain the flow along the trajectory, warp every frame onto the target
+  ↓  for EVERY frame: chain the flow over a ±radius window, warp the neighbours onto it
   ↓  robust weighted merge (median reference → Gaussian weights)
-  ↓  optional single-frame denoise of the merged result
-one clean photo
+  ↓  optional single-frame denoise of each result
+denoised sequence (same length, same fps)
 ```
+
+`denoise_sequence()` is the main entry; `fuse()` is the same machinery specialised to one
+target frame, for when you want a single still out of a burst.
 
 ### Three bugs fixed relative to the original
 
@@ -53,7 +56,24 @@ The **40.66 dB static-region figure** recorded in NPSS-Enhancer's history came f
 footage**, where frames are captured rather than resampled. Reproducing it needs a real clip;
 the harness here cannot substitute for one.
 
-## Measured
+## Measured on real footage
+
+iPhone still-life clip, 1088×1440, 28.5 fps, 24 frames, handheld drift up to ±15 px,
+noise estimated at σ ≈ 1.7/255:
+
+| | single frame | `denoise_sequence(radius=3)` |
+|---|---|---|
+| noise σ | 1.72 | **1.42** (−17%) |
+| per-frame drop | — | 12% … 23% |
+
+Visually the 500ML label text and the gold grain on the bottle become resolvable where the
+single frame has grain mixing into them. Cost: **4.8 s/frame** at 1.57 MP on CPU (flow
+dominates).
+
+Why only −17% instead of the −67% that √9 suggests: the camera drifts ~15 px over the clip and
+the registration residual eats most of the averaging.
+
+## Measured on synthetic bursts
 
 `python3 benchmark.py` — synthetic burst: a textured 384×384 scene, per-frame random shifts
 up to ±2 px, AWGN σ=20.

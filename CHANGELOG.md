@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.0 — 2026-11-22
+
+The method is a **continuous time-series complement**, not a burst-to-one-still fusion.
+Renamed the project to NPSS-Temporal and made the sequence path the main entry.
+
+- `denoise_sequence(frames, radius=3)` — every output frame is accumulated from a ±radius
+  window of its temporal neighbours along their motion trajectories. Output length and fps
+  match the input.
+- `write_video()` — encode the result to H.264 with ffmpeg.
+- `fuse()` remains as the single-target special case.
+
+### Measured on a real iPhone clip (1088×1440, 28.5 fps, 24 frames, drift ≈15 px)
+
+| | single | sequence (radius 3) |
+|---|---|---|
+| noise σ | 1.72 | **1.42** (−17%) |
+| per-frame | — | 12–23% |
+
+Cost 4.8 s/frame at 1.57 MP on CPU. The gap to the theoretical √9 (−67%) is registration
+residual caused by the handheld drift.
+
 ## 1.1.0 — 2026-11-21
 
 Replaced the global-affine core with the **trajectory accumulation** implementation from
