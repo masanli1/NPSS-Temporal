@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.png
+!docs/*.png
+.DS_Store
+burst_clean.png

@@ -1,0 +1,4 @@
+numpy>=1.21
+Pillow>=9.0
+# 可选：从视频取帧时才需要
+imageio-ffmpeg>=0.4
