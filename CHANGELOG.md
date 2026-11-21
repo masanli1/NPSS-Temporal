@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.4.0 — 2026-11-22
+
+Added `flow_split()` — optical-flow alignment, background subtraction, subject compositing
+(the "背景重建 + 人物合成" route), and measured it honestly.
+
+| route (σ=12 added, 12 frames, ground truth) | PSNR | SSIM |
+|---|---|---|
+| noisy | 26.7 | 0.69 |
+| **single-frame NPSS** | **36.0** | **0.96** |
+| temporal median background (aligned space) | 33.8 | 0.94 |
+| temporal median bg + spatial denoise (aligned space) | 35.0 | 0.96 |
+| flow_split, thr 1.5σ / 2σ / 3σ | 29.8 / 27.7 / 26.9 | 0.91 / 0.88 / 0.86 |
+
+`flow_split` loses to the plain background estimate for two reasons:
+
+1. the background is reconstructed in the reference frame's coordinates and then **warped back
+   per frame**, so it is resampled twice — that alone costs several dB;
+2. the mask threshold trades subject leakage against background loss, and neither setting wins.
+
+**The original implementation of this route does not exist in the repository.** A full-history
+search (`git rev-list --all | xargs git grep`) finds "背景重建" only in
+`docs/history/2026-10-trajectory-video/README.md`, and no .py in any commit contains
+sparse / RPCA / low-rank / background code. The 40.66 dB figure was recorded in prose as a
+rejected experiment; its code was never committed.
+
 ## 1.3.0 — 2026-11-22
 
 Added the other three routes recorded for video, plus noise injection for evaluation.

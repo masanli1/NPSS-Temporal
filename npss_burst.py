@@ -484,3 +484,99 @@ def denoise_rpca(seq, sigma=None, subject_denoise=True, scale=4, iters=60):
     out = np.clip(Lb + sd, 0, 1).astype(np.float32)
     info["subject_denoise"] = bool(subject_denoise)
     return out, info
+
+# ------------------------------------------- flow-based subject/background split
+def camera_model(u, v, iters=3):
+    """Fit the global camera motion (affine) to a flow field, robustly."""
+    H, W = u.shape
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    xn = ((xx - W / 2) / W).ravel()
+    yn = ((yy - H / 2) / H).ravel()
+    A = np.stack([np.ones_like(xn), xn, yn], 1)
+    uu, vv = u.ravel().astype(np.float64), v.ravel().astype(np.float64)
+    w = np.ones_like(uu)
+    cu = cv = None
+    for _ in range(iters):
+        Aw = A * w[:, None]
+        cu = np.linalg.lstsq(Aw, uu * w, rcond=None)[0]
+        cv = np.linalg.lstsq(Aw, vv * w, rcond=None)[0]
+        r = np.hypot(uu - A @ cu, vv - A @ cv)
+        sc = max(float(np.median(r)), 0.25)   # 残差极小时不重加权，否则权重塌成 0 后 lshtsq 溢出
+        w = 1.0 / (1.0 + (r / (3 * sc)) ** 2)      # 软降权，抑制主体对拟合的拉扯
+    return (A @ cu).reshape(H, W).astype(np.float32), (A @ cv).reshape(H, W).astype(np.float32)
+
+
+def motion_mask(u, v, thr_px=1.0, dilate=3):
+    """Subject mask: flow that deviates from the *global camera motion*.
+
+    Using the median flow as the camera model does not work — handheld drift makes the field
+    spatially uneven, so nearly everything looks like a subject (measured 87% of pixels).
+    An affine fit removes the camera motion properly and leaves only genuine movement.
+    """
+    cu, cv = camera_model(u, v)
+    dev = np.hypot(u - cu, v - cv)
+    m = (dev > thr_px).astype(np.float32)
+    if dilate > 0:
+        m = (M.gaussian_blur(m, dilate) > 0.05).astype(np.float32)
+    return m
+
+
+def flow_split(seq, sigma=None, thr_sigma=2.0, dilate=3, subject_denoise=True, two_pass=True):
+    """Optical-flow alignment + background subtraction + subject compositing.
+
+    1. flow of every frame against the reference; align
+    2. background = per-pixel mean over the frames where the pixel is *static*
+       (noise drops by √N over the whole clip — this is the 40 dB static region)
+    3. subject mask = residual against that background (standard background subtraction;
+       the raw flow field is too rough here to serve as a mask directly)
+    4. output = background + the denoised subject composited back in
+    """
+    seq = np.asarray(seq, np.float32)
+    single = seq.ndim == 3
+    if single:
+        seq = seq[..., None]
+    n, H, W, C = seq.shape
+    if sigma is None:
+        y = M.luma(seq[n // 2])
+        sigma = float(np.median(np.abs(y - M.gaussian_blur(y, 1.2))) / 0.6745)
+    sigma = max(float(sigma), 1e-4)
+
+    ri = n // 2
+    ref_l = M.luma(seq[ri])
+    flows, aligned = [], []
+    for i in range(n):
+        if i == ri:
+            z = np.zeros((H, W), np.float32); u, v = z, z
+        else:
+            u, v = bm_flow_pyramid(ref_l, M.luma(seq[i]))
+        flows.append((u, v))
+        aligned.append(warp(seq[i], u, v))
+    aligned = np.stack(aligned)
+
+    # 第一遍：全帧均值当背景；第二遍：剔除主体后重新平均
+    bg = aligned.mean(0)
+    for _ in range(2 if two_pass else 1):
+        res = np.abs(aligned - bg).mean(-1)
+        masks = (res > thr_sigma * sigma).astype(np.float32)
+        if dilate > 0:
+            masks = np.stack([(M.gaussian_blur(masks[i], dilate) > 0.05).astype(np.float32)
+                              for i in range(n)])
+        w = (1.0 - masks)[..., None]
+        wsum = w.sum(0)
+        bg = (aligned * w).sum(0) / np.maximum(wsum, 1.0)
+        hole = (wsum < 0.5)[..., 0]
+        if np.any(hole):
+            bg[hole] = aligned.mean(0)[hole]
+    background = np.clip(bg, 0, 1).astype(np.float32)
+
+    out = np.empty_like(seq)
+    for i in range(n):
+        u, v = flows[i]
+        bg_i = warp(background, -u, -v)
+        mk = masks[i][..., None]
+        fg = seq[i]
+        if subject_denoise:
+            fg = np.clip(M.denoise(fg, sigma=sigma)[0], 0, 1)
+        out[i] = np.clip(mk * fg + (1 - mk) * bg_i, 0, 1)
+    info = {"frames": n, "sigma": float(sigma), "subject_frac": float(masks.mean())}
+    return (out[..., 0] if single else out), info
