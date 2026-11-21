@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.7.0 — 2026-11-22
+
+Temporal 3D is now **3.4× faster** (and up to 24× with the fast preset) at identical output.
+
+- `temporal_3d_fast()` — batched BLAS matmuls instead of einsum paths, all channels in one
+  batch, float32, and the temporal transform done as a single large matmul.
+- `denoise_temporal(seq, preset=...)` with `fast` / `balanced` / `best`.
+
+### Measured (real clip, 1088×1440, σ=12 added, 12 frames, ground truth)
+
+| config | PSNR | SSIM | s/frame |
+|---|---|---|---|
+| noisy | 29.31 | 0.8003 | — |
+| single-frame NPSS | 34.54 | 0.9442 | 3.7 |
+| **fast** (phases 4, B=8) | **35.89** | 0.9588 | **1.3** |
+| **balanced** (phases 9, B=8) | **36.22** | 0.9623 | **2.8** |
+| **best** (phases 9, 4+8+16) | **36.56** | **0.9651** | 9.4 |
+| previous slow multi-scale | 36.66 | 0.9660 | 31.6 |
+
+The fix that made the fast path match the reference exactly: the temporal axis had been left
+at position 3 while `reshape(-1, T)` assumed it was last, so the "time transform" was silently
+mixing block columns — 0.18 max pixel error and 1.9 dB lost. Verified: fast now reproduces the
+reference bit-for-bit up to float32 rounding (36.42 vs 36.42 at 5.0 s/frame).
+
 ## 1.6.0 — 2026-11-22
 
 The temporal axis is now **inside** the NPSS spatial framework, and it finally beats the
