@@ -16,6 +16,7 @@ from __future__ import annotations
 import subprocess
 
 import numpy as np
+from PIL import Image
 
 import npss_image as M
 _GRID = {}
@@ -116,7 +117,9 @@ def bm_flow(a, b, B=8, R=6, scale=4):
 
 
 def warp(img, u, v):
-    """双线性重采样（flat take）。"""
+    """双线性重采样（flat take）。支持灰度 (H,W) 与彩色 (H,W,C)。"""
+    if img.ndim == 2:
+        return warp(img[..., None], u, v)[..., 0]
     H, W = img.shape[:2]
     yy, xx = _grid(H, W)
     gx = np.clip(xx + u, 0, W - 1.001)
@@ -327,3 +330,157 @@ def write_video(path, frames, fps=30, crf=18):
     finally:
         p.wait()
     return path
+
+# ------------------------------------------------------------ noise injection
+def add_noise(frames, sigma, seed=None):
+    """Add white Gaussian noise to a sequence (for testing against a clean reference).
+
+    sigma is on the 0-255 scale. Returns float32 frames in 0..1.
+    """
+    frames = np.asarray(frames, np.float32)
+    rng = np.random.default_rng(seed)
+    n = rng.normal(0.0, float(sigma) / 255.0, frames.shape).astype(np.float32)
+    return np.clip(frames + n, 0, 1)
+
+# ------------------------------------------------- 3D sparse reconstruction
+def _dct_mat(n):
+    k = np.arange(n)[:, None]
+    m = np.arange(n)[None, :]
+    d = np.sqrt(2.0 / n) * np.cos(np.pi * (2 * m + 1) * k / (2.0 * n))
+    d[0] /= np.sqrt(2.0)
+    return d
+
+
+def _sparse_window(win, Ks, Kt, k0, sigma, B):
+    """One K-frame window -> sparse 3D reconstruction of its centre frame.
+
+    win: (K, H, W) float. Transform: 2D DCT (space) x 1D DCT (time), threshold, invert.
+    """
+    K, H, W = win.shape
+    h8, w8 = H // B * B, W // B * B
+    ny, nx = h8 // B, w8 // B
+    blk = (win[:, :h8, :w8].reshape(K, ny, B, nx, B).transpose(1, 3, 2, 4, 0)
+           .reshape(ny, nx, B, B, K).astype(np.float64))
+    C = np.einsum("ua,xyabt->xyubt", Ks, blk, optimize=True)
+    C = np.einsum("vb,xyubt->xyuvt", Ks, C, optimize=True)
+    C = np.einsum("kt,xyuvt->xyuvk", Kt, C, optimize=True)
+    th = k0 * sigma          # 正交 DCT：每个系数的噪声标准差都是 σ，不随维度放大
+    g = np.abs(C) > th
+    g[0, 0, 0, 0, :] = True                    # 空间 DC 的时间分量全留
+    g[..., 0] = True                           # 时间 DC 全留（静态内容在这里）
+    C = C * g
+    R = np.einsum("kt,xyuvk->xyuvt", Kt, C, optimize=True)
+    R = np.einsum("vb,xyuvt->xyubt", Ks, R, optimize=True)
+    R = np.einsum("ua,xyubt->xyabt", Ks, R, optimize=True)
+    rec = R.transpose(0, 1, 2, 3, 4).reshape(ny, B, nx, B, K)
+    mid = K // 2
+    rec = R.reshape(ny, nx, B, B, K)[..., mid].transpose(0, 2, 1, 3).reshape(h8, w8)
+    out = np.zeros((H, W), np.float32)
+    out[:h8, :w8] = rec
+    return out
+
+
+def sparse_3d(seq, K=3, k0=3.0, sigma=None, B=8):
+    """Sparse reconstruction over a persistent time series (3D transform domain).
+
+    For every frame a K-frame tensor is formed, transformed by 2D DCT (space) x 1D DCT
+    (time), sparsely thresholded, and inverted back to the centre frame. Static content piles
+    up in the temporal DC coefficient; noise spreads into the temporal high frequencies and is
+    thresholded away. Motion produces *large* temporal coefficients that survive the
+    threshold, so moving regions keep their detail instead of being averaged into a blur.
+
+    seq: (N, H, W) or (N, H, W, C) float 0..1. K=3 is the sweet spot.
+    """
+    seq = np.asarray(seq, np.float32)
+    n = len(seq)
+    if n < K:
+        K = n
+    single = seq.ndim == 3
+    if single:
+        seq = seq[..., None]
+    H, W, C = seq.shape[1:]
+    if sigma is None:
+        y = M.luma(seq[n // 2])
+        sigma = float(np.median(np.abs(y - M.gaussian_blur(y, 1.2))) / 0.6745)
+    sigma = max(float(sigma), 1e-4)
+    Ks, Kt = _dct_mat(B), _dct_mat(K)
+    half = K // 2
+    out = np.zeros_like(seq)
+    for c in range(C):
+        pad = np.pad(seq[..., c], ((half, K - 1 - half), (0, 0), (0, 0)), mode="edge")
+        for i in range(n):
+            out[i, ..., c] = _sparse_window(pad[i:i + K], Ks, Kt, k0, sigma, B)
+    out = np.clip(out, 0, 1).astype(np.float32)
+    return (out[..., 0] if single else out), {"frames": n, "K": int(K), "sigma": float(sigma)}
+
+# --------------------------------------------- low-rank / sparse decomposition
+def _soft(x, t):
+    return np.sign(x) * np.maximum(np.abs(x) - t, 0.0)
+
+
+def _svt(x, t):
+    u, sv, vt = np.linalg.svd(x, full_matrices=False)
+    sv = np.maximum(sv - t, 0.0)
+    return (u * sv) @ vt
+
+
+def rpca(seq, scale=4, iters=60, lam=None):
+    """Robust PCA: V = L + S, L low-rank (background), S sparse (moving subject).
+
+    The low-rank part aggregates the *whole* sequence, so background noise is averaged over
+    every frame rather than a short window — that is where the 40 dB+ static-region numbers
+    come from. The sparse part keeps the subject intact instead of averaging it into a blur.
+
+    Computed on a 1/scale grid for speed, then the low-rank part is upsampled and the
+    residual (subject + noise) is recovered at full resolution.
+    """
+    seq = np.asarray(seq, np.float32)
+    single = seq.ndim == 3
+    if single:
+        seq = seq[..., None]
+    n, H, W, C = seq.shape
+    sc = max(1, int(scale))
+    h, w = H // sc, W // sc
+    small = seq[:, :h * sc, :w * sc].reshape(n, h, sc, w, sc, C).mean((2, 4))   # (n,h,w,C)
+    M = small.reshape(n, -1).T.astype(np.float64)         # (D,n)
+    D = M.shape[0]
+    if lam is None:
+        lam = 1.0 / np.sqrt(max(D, n))
+    u, sv, vt = np.linalg.svd(M, full_matrices=False)
+    norm2 = float(sv[0]) if sv.size else 1.0
+    Y = M / max(norm2, 1e-9)
+    mu = 1.25 / max(norm2, 1e-9)
+    S = np.zeros_like(M)
+    L = np.zeros_like(M)
+    for _ in range(iters):
+        L = _svt(M - S + Y / mu, 1.0 / mu)
+        S = _soft(M - L + Y / mu, lam / mu)
+        Z = M - L - S
+        Y = Y + mu * Z
+        mu = min(mu * 1.05, mu * 1.05)
+        if float(np.abs(Z).max()) < 1e-6:
+            break
+    Ls = L.T.reshape(n, h, w, C)
+    # 上采样低秩部分
+    Lb = np.stack([np.stack([np.asarray(Image.fromarray(np.float32(Ls[i, ..., c])).resize((W, H), Image.BICUBIC))
+                             for c in range(C)], -1) for i in range(n)])
+    S_full = seq - np.clip(Lb, 0, 1)
+    info = {"frames": n, "scale": sc, "lam": float(lam), "rank_energy": float(sv[:5].sum() / max(sv.sum(), 1e-9))}
+    return np.clip(Lb, 0, 1).astype(np.float32), S_full.astype(np.float32), info
+
+
+def denoise_rpca(seq, sigma=None, subject_denoise=True, scale=4, iters=60):
+    """Background reconstruction + subject compositing.
+
+    L (low-rank background, noise averaged over the whole clip) + denoised S (sparse
+    subject). This is the "背景重建 + 人物合成" route recorded in NPSS-Enhancer.
+    """
+    Lb, S_full, info = rpca(seq, scale=scale, iters=iters)
+    n = len(Lb)
+    if subject_denoise:
+        sd = np.stack([np.clip(M.denoise(S_full[i], sigma=sigma)[0], -1, 1) for i in range(n)])
+    else:
+        sd = S_full
+    out = np.clip(Lb + sd, 0, 1).astype(np.float32)
+    info["subject_denoise"] = bool(subject_denoise)
+    return out, info

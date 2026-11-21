@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.3.0 — 2026-11-22
+
+Added the other three routes recorded for video, plus noise injection for evaluation.
+
+- `add_noise(seq, sigma)` — inject AWGN so a clean clip can serve as ground truth.
+- `sparse_3d(seq, K=3)` — 3D transform-domain sparse reconstruction: 2D DCT (space) ×
+  1D DCT (time), threshold, invert. Static content piles into the temporal DC; motion
+  produces large temporal coefficients that survive, so it does not average motion away.
+- `rpca(seq)` / `denoise_rpca()` — low-rank background + sparse subject decomposition,
+  the "背景重建 + 人物合成" route recorded in NPSS-Enhancer's history.
+
+### Measured against real ground truth (iPhone still-life, σ=12 added, 12 frames)
+
+| route | PSNR | SSIM |
+|---|---|---|
+| noisy | 26.7 | 0.69 |
+| **single-frame NPSS** | **36.0** | **0.96** |
+| 3D sparse, K=3 | 28.9 | 0.78 |
+| 3D sparse, K=7 | 29.9 | 0.82 |
+| flow accumulation, r=1 | 31.3 | 0.88 |
+| RPCA low-rank part (unaligned / aligned) | 20.5 / 26.9 | — |
+| temporal median background | 33.8 | 0.94 |
+| **temporal median background + spatial denoise** | **35.0** | **0.96** |
+
+**Honest conclusion: no temporal route here beats the single-frame denoiser on this material.**
+The temporal/low-rank routes buy +4–5 dB (matching √N theory for 12 frames) while the
+single-frame DCT route buys +9.3 dB, so the spatial prior is worth more than the temporal one
+at this clip length. `rpca` also needs a static camera: with 15 px of drift the background is
+not low-rank (20.5 dB), and even after alignment its ALM implementation is numerically fragile.
+
 ## 1.2.0 — 2026-11-22
 
 The method is a **continuous time-series complement**, not a burst-to-one-still fusion.
