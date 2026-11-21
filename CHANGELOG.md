@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.6.0 — 2026-11-22
+
+The temporal axis is now **inside** the NPSS spatial framework, and it finally beats the
+single-frame denoiser.
+
+`temporal_3d(aligned, K=3, blocks=(4,8,16), phases=16, k0=3.0, k0_ac=6.0)`:
+
+- per frame, per block size, per cycle-spinning phase: build a (T, B, B) tensor
+- 2D DCT in space, **1D DCT in time**, hard threshold, invert, take the temporal centre frame
+- average over phases and scales
+- **separate threshold for the temporal ACs** (`k0_ac`, ≈6σ): the temporal DC carries the
+  static part and is thresholded like a spatial coefficient, while the temporal ACs carry
+  motion — only strong ones survive, so moving detail is kept instead of averaged away
+
+### Measured (real iPhone clip, 1088×1440, σ=12 added, 12 frames, ground truth)
+
+| method | PSNR | SSIM |
+|---|---|---|
+| noisy | 29.31 | 0.8003 |
+| single-frame NPSS (same aligned data) | 34.54 | 0.9442 |
+| **temporal_3d K=3, B=8** | **36.42** | **0.9641** |
+| **temporal_3d K=3, 4+8+16** | **36.66** | **0.9660** |
+
++2.12 dB and +0.022 SSIM over the single-frame denoiser. Cost: 8.1 s/frame single scale,
+31.6 s/frame multi-scale at 1.57 MP.
+
+### Bugs fixed on the way (all in the transform plumbing)
+
+- block layout: the padded array's first axis is time, not rows
+- inverse transforms: two einsums used `Ks` where `Ksᵀ` was needed (and one the reverse),
+  which silently produced 12–19 dB output
+- the temporal inverse had the same label swap as the spatial one
+
 ## 1.5.0 — 2026-11-22
 
 `idm_temporal()` — the three-layer mechanism from the source document

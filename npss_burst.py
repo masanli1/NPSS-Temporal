@@ -670,3 +670,88 @@ def idm_temporal(aligned, sigma=None, K=3, B=8, tau=2.0, min_consistent=0.6):
     return (out[..., 0] if single else out), {"frames": n, "K": K, "tau": tau,
                                               "consistent_frac": float(np.mean(consistent))
                                               if 'consistent' in dir() else 0.0}
+
+# ------------------------- temporal dimension inside the NPSS spatial framework
+def _phases(B, n_phase):
+    """Cycle-spinning offsets for a BxB block."""
+    n = int(max(1, round(np.sqrt(n_phase))))
+    step = max(1, B // max(n, 1))
+    return sorted({(int(i * step) % B, int(j * step) % B) for i in range(n) for j in range(n)})
+
+
+def temporal_3d(aligned, sigma=None, K=3, blocks=(4, 8, 16), phases=16, k0=3.0, lam=0.5, k0_ac=None):
+    """NPSS spatial machinery (multi-scale x cycle spinning x rho) plus a temporal axis.
+
+    For every output frame, for each block size B and each cycle-spinning phase:
+      tensor (T, B, B)  -- 2D DCT in space, 1D DCT in time, hard threshold at k0*sigma
+      (orthonormal, so noise has sigma at every coefficient). The temporal DC carries the
+      static part; the temporal ACs carry motion -- large ones survive, noisy ones die.
+      The threshold is relaxed where the structure-confidence map rho says phases agree.
+    Averaged over phases and scales; the temporal centre frame is the output.
+    """
+    aligned = np.asarray(aligned, np.float32)
+    single = aligned.ndim == 3
+    if single:
+        aligned = aligned[..., None]
+    n, H, W, C = aligned.shape
+    T = int(max(1, min(K, n)))
+    half = T // 2
+    if sigma is None:
+        y = M.luma(aligned[n // 2])
+        sigma = float(np.median(np.abs(y - M.gaussian_blur(y, 1.2))) / 0.6745)
+    sigma = max(float(sigma), 1e-4)
+    Kt = _dct_mat(T)
+
+    out = np.empty_like(aligned)
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        idx = list(range(lo, hi))
+        while len(idx) < T:
+            idx.insert(0, idx[0]) if lo == 0 else idx.append(idx[-1])
+        win = aligned[idx]                                    # (T,H,W,C)
+        mid = M.luma(aligned[i])
+        acc = np.zeros((H, W, C), np.float64)
+        cnt = 0
+        for B in blocks:
+            Ks = _dct_mat(B)
+            rho = M.structure_confidence(mid, sigma / np.sqrt(T), k0, B) if lam > 0 else None
+            for (sy, sx) in _phases(B, phases):
+                for c in range(C):
+                    p3 = np.pad(win[..., c], ((0, 0), (sy, sy + B), (sx, sx + B)),
+                                mode="symmetric").transpose(1, 2, 0)   # (H',W',T)
+                    ny, nx = p3.shape[0] // B, p3.shape[1] // B
+                    blk = (p3[:ny * B, :nx * B].reshape(ny, B, nx, B, T)
+                           .transpose(0, 2, 4, 1, 3).astype(np.float64))   # (Y,X,T,R,C)
+                    f1 = np.einsum("pr,yxtrc->yxtpc", Ks, blk, optimize=True)
+                    f2 = np.einsum("qc,yxtpc->yxtpq", Ks, f1, optimize=True)
+                    f3 = np.einsum("st,yxtpq->yxspq", Kt, f2, optimize=True)
+                    thr = k0 * sigma
+                    if rho is not None:
+                        rp = np.pad(rho, ((sy, sy + B), (sx, sx + B)), mode="symmetric")
+                        rb = rp[:ny * B, :nx * B].reshape(ny, B, nx, B).mean(axis=(1, 3))
+                        tm = thr * np.clip(1.0 - lam * rb, 0.3, 1.0)
+                    else:
+                        tm = np.full((ny, nx), thr)
+                    # 时间 DC 走空间阈值；时间 AC 是"运动证据"，给它独立的（通常更高）阈值
+                    thr_arr = np.full((ny, nx, T), thr)
+                    if k0_ac is not None:
+                        thr_arr[..., 1:] = k0_ac * sigma
+                    else:
+                        thr_arr[..., 1:] = thr
+                    g = np.abs(f3) > thr_arr[:, :, :, None, None]
+                    g[:, :, :, 0, 0] = True                        # 空间 DC 的时间分量保留
+                    f3 = f3 * g
+                    i3 = np.einsum("st,yxspq->yxtpq", Kt, f3, optimize=True)   # 时间逆变换
+                    i2 = np.einsum("qc,yxtpq->yxtpc", Ks, i3, optimize=True)   # 逆变换右乘 Ks（不是 Ksᵀ）
+                    i1 = np.einsum("pr,yxtpc->yxtrc", Ks, i2, optimize=True)
+                    rec = i1[:, :, half].transpose(0, 2, 1, 3).reshape(ny * B, nx * B)
+                    full = np.zeros((ny * B, nx * B), np.float64)
+                    full[:rec.shape[0], :rec.shape[1]] = rec
+                    padH, padW = H + 2 * B, W + 2 * B
+                    F = np.zeros((padH, padW), np.float64)
+                    F[:full.shape[0], :full.shape[1]] = full
+                    acc[..., c] += F[sy:sy + H, sx:sx + W]
+                cnt += 1
+        out[i] = np.clip(acc / max(cnt, 1), 0, 1)
+    out = out.astype(np.float32)
+    return (out[..., 0] if single else out), {"frames": n, "K": T, "blocks": blocks, "phases": phases}
