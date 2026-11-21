@@ -12,14 +12,46 @@ Pure numpy for the core; ffmpeg only to pull frames out of a video.
 
 ## Pipeline
 
+Extracted from NPSS-Enhancer's `GUI/traj_denoise.py` (trajectory accumulation):
+
 ```
 N consecutive frames
-  ↓  per-frame affine registration (block phase correlation, sub-pixel + SSD refine)
-  ↓  robust weighted fusion (median reference → Gaussian weights → weighted mean)
-  ↓  single-frame denoise (NPSS) as the fallback
-  ↓  temporal-consistency blend (moving regions fall back to the single frame)
+  ↓  block-matching flow between consecutive frames (coarse-to-fine pyramid)
+  ↓  chain the flow along the trajectory, warp every frame onto the target
+  ↓  robust weighted merge (median reference → Gaussian weights)
+  ↓  optional single-frame denoise of the merged result
 one clean photo
 ```
+
+### Three bugs fixed relative to the original
+
+| bug | effect | fix |
+|---|---|---|
+| flow computed only at 1/4 resolution | a 1–2 px jitter is **invisible** (measured Δ = 0.00 px, no correction at all) | full-resolution pass added; coarse-to-fine pyramid covers ±24 px *and* sub-pixel |
+| flat blocks win at the first search offset | blocks with no texture have zero error at every offset (aperture problem), so the border offset `-R` wins and smears over the whole field — a **zero-displacement** pair reported **−4.65 px** | variance gate rejects flat blocks, then the field is inpainted from valid neighbours |
+| block error not normalised by overlap | border blocks (no overlap) always score worst/best arbitrarily | error divided by the number of overlapping pixels |
+
+Measured registration quality on noise-free integer crops:
+
+| true shift | before | after |
+|---|---|---|
+| 0 px | 34.16 dB (flow −4.65 px) | **108.00 dB** (flow 0.00 px) |
+| 1 px | 33.47 dB | **39.58 dB** |
+| 3,−2 px | 33.79 dB | **36.81 dB** |
+
+## Honest status of the numbers
+
+`benchmark.py` synthesises bursts by resampling and by cropping, and **neither can
+reproduce a 40 dB fusion result**:
+
+- resampled frames are blurred by the interpolation itself — the ceiling is ~31 dB no matter
+  how many frames are fused;
+- 1/f random textures do not share content between crops, so averaging different crops is not
+  the same signal.
+
+The **40.66 dB static-region figure** recorded in NPSS-Enhancer's history came from **real
+footage**, where frames are captured rather than resampled. Reproducing it needs a real clip;
+the harness here cannot substitute for one.
 
 ## Measured
 

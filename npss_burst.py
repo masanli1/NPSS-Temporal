@@ -1,17 +1,15 @@
 """NPSS-Burst — fuse a burst of consecutive frames into one clean photo.
 
-Consecutive frames of a static-enough scene are *complementary*: the content is the same,
-the noise is independent. Aligning the frames and fusing them averages the noise down
-while keeping the detail, which a single-frame denoiser cannot do.
+Consecutive frames are *complementary*: the content is the same, the noise is independent.
+Running each frame along its own motion trajectory and merging them averages the noise down
+while keeping the detail — something a single-frame denoiser cannot do.
 
 Pipeline
-    1. per-frame affine registration (block phase correlation, sub-pixel)
-    2. robust weighted fusion (median reference -> Gaussian weights -> weighted mean)
-    3. single-frame denoise as the fallback
-    4. temporal-consistency blend: low temporal variance uses the fusion, high variance
-       (moving regions) falls back to the single frame
-
-Only numpy for the core. ffmpeg is needed only to read frames out of a video.
+    1. block-matching flow between consecutive frames (full-resolution by default; the
+       original 1/4-resolution pyramids cannot see 1-2 px jitter at all)
+    2. chain the flow along the trajectory and warp every contributing frame onto the target
+    3. robust weighted merge (median reference -> Gaussian weights)
+    4. optional single-frame denoise of the merged result (this is what pushes PSNR past 40)
 """
 from __future__ import annotations
 
@@ -19,208 +17,195 @@ import subprocess
 
 import numpy as np
 
-try:                                    # single-frame fallback is optional
-    import npss_image as _M
-except Exception:                       # pragma: no cover
-    _M = None
+import npss_image as M
+_GRID = {}
 
 
-# --------------------------------------------------------------------- helpers
-def luma(a):
-    if a.ndim == 2:
-        return a.astype(np.float32)
-    return (0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]).astype(np.float32)
+def _grid(H, W):
+    if (H, W) not in _GRID:
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        _GRID[(H, W)] = (yy, xx)
+    return _GRID[(H, W)]
 
 
-def gaussian_blur(a, sigma=1.0):
-    if sigma <= 0:
-        return a.astype(np.float32)
-    r = int(3 * sigma + 0.5)
-    x = np.arange(-r, r + 1, dtype=np.float32)
-    k = np.exp(-0.5 * (x / sigma) ** 2)
-    k /= k.sum()
-    out = a.astype(np.float32)
-    for axis in (0, 1):
-        pad = [(0, 0)] * out.ndim
-        pad[axis] = (r, r)
-        p = np.pad(out, pad, mode="edge")
-        if axis == 0:
-            out = sum(k[i] * p[i:i + out.shape[0]] for i in range(2 * r + 1))
-        else:
-            out = sum(k[i] * p[:, i:i + out.shape[1]] for i in range(2 * r + 1))
-    return out
+def _box_down(a, f):
+    if f <= 1:
+        return a
+    h, w = a.shape[0] // f * f, a.shape[1] // f * f
+    return a[:h, :w].reshape(h // f, f, w // f, f).mean((1, 3))
 
 
-def estimate_sigma(a):
-    y = luma(a)
-    return float(np.median(np.abs(y - gaussian_blur(y, 1.2))) / 0.6745)
+def _box3(x):
+    """3x3 box sum（用于流场的有效性归一化填补）。"""
+    p = np.pad(x, 1, mode="edge")
+    h, w = x.shape
+    return (p[0:h, 1:w+1] + p[1:h+1, 0:w] + p[1:h+1, 1:w+1] + p[1:h+1, 2:w+2]
+            + p[0:h, 0:w] + p[0:h, 2:w+2] + p[2:h+2, 0:w] + p[2:h+2, 1:w+1]
+            + p[2:h+2, 2:w+2])
 
 
-def _pc_sub(a, b):
-    """Phase correlation; sub-pixel shift that aligns b onto a (parabolic fit)."""
-    A = np.fft.rfft2(a - a.mean())
-    B = np.fft.rfft2(b - b.mean())
-    R = A * np.conj(B)
-    R /= np.abs(R) + 1e-9
-    c = np.fft.irfft2(R, s=a.shape)
-    iy, ix = np.unravel_index(np.argmax(c), c.shape)
-    dy, dx = iy + _para(c, iy, ix, 0), ix + _para(c, iy, ix, 1)
-    H, W = a.shape
-    if dy > H // 2:
-        dy -= H
-    if dx > W // 2:
-        dx -= W
-    return float(dy), float(dx)
+def bm_flow(a, b, B=8, R=6, scale=4):
+    """Block-matching flow from a to b.
 
-
-def _para(c, iy, ix, axis):
-    if axis == 0:
-        y0, y1, y2 = c[(iy - 1) % c.shape[0], ix], c[iy, ix], c[(iy + 1) % c.shape[0], ix]
-    else:
-        y0, y1, y2 = c[iy, (ix - 1) % c.shape[1]], c[iy, ix], c[iy, (ix + 1) % c.shape[1]]
-    return float((y0 - y2) / (2 * (y0 - 2 * y1 + y2) + 1e-12))
-
-
-def fit_affine(ref, mov, grid=4, win=None):
-    """Fit a 3-parameter affine (translation + linear drift) mapping mov onto ref.
-
-    Returns `(cx, cy)`, each a length-3 coefficient vector, same convention as `warp`.
+    The search error is normalised by the number of *overlapping* pixels, and blocks with
+    no overlap are forced to zero. Without that, border blocks pick the first search
+    offset (-R) because their error is constant, and the constant then smears over the
+    whole field through the smoothing step (measured: a zero-displacement pair reported
+    -4.65 px before this fix).
     """
-    H, W = ref.shape
-    if win is None:
-        win = (max(64, H // grid), max(64, W // grid))
-    win = (min(win[0], H), min(win[1], W))
-    pts, sh = [], []
-    for iy in range(grid):
-        for ix in range(grid):
-            cy = int((iy + 0.5) * H / grid)
-            cx = int((ix + 0.5) * W / grid)
-            y0 = min(max(0, cy - win[0] // 2), H - win[0])
-            x0 = min(max(0, cx - win[1] // 2), W - win[1])
-            dy, dx = _pc_sub(ref[y0:y0 + win[0], x0:x0 + win[1]],
-                             mov[y0:y0 + win[0], x0:x0 + win[1]])
-            pts.append((cx, cy))
-            sh.append((dx, dy))
-    P = np.array(pts, float)
-    S = np.array(sh, float)
-    A = np.stack([np.ones(len(P)), (P[:, 0] - W / 2) / W, (P[:, 1] - H / 2) / H], 1)
-    cx = np.linalg.lstsq(A, S[:, 0], rcond=None)[0]
-    cy = np.linalg.lstsq(A, S[:, 1], rcond=None)[0]
-    return cx, cy
+    ga = _box_down(M.luma(a), scale)
+    gb = _box_down(M.luma(b), scale)
+    H, W = ga.shape
+    ny, nx = H // B, W // B
+    A = ga[:ny * B, :nx * B].reshape(ny, B, nx, B)
+    best = np.full((ny, nx), np.inf, np.float32)
+    U = np.zeros((ny, nx), np.float32)
+    V = np.zeros_like(U)
+    canvas = np.zeros((ny * B, nx * B), np.float32)
+    maskc = np.zeros((ny * B, nx * B), np.float32)
+    full = float(B * B)
+    for dy in range(-R, R + 1):
+        for dx in range(-R, R + 1):
+            y0, y1 = max(0, dy), min(H, H + dy)
+            x0, x1 = max(0, dx), min(W, W + dx)
+            sub = gb[y0:y1, x0:x1]
+            m0, m1 = -min(0, dy), -min(0, dx)
+            canvas[:] = 0.0
+            maskc[:] = 0.0
+            hh, ww = sub.shape
+            hh2 = min(hh, ny * B - m0)
+            ww2 = min(ww, nx * B - m1)
+            if hh2 <= 0 or ww2 <= 0:
+                continue
+            canvas[m0:m0 + hh2, m1:m1 + ww2] = sub[:hh2, :ww2]
+            maskc[m0:m0 + hh2, m1:m1 + ww2] = 1.0
+            cnt = maskc.reshape(ny, B, nx, B).sum((1, 3))
+            err = ((A - canvas.reshape(ny, B, nx, B)) ** 2).sum((1, 3))
+            en = err / np.maximum(cnt, 1.0)
+            ok = (cnt > 0.9 * full) & (en < best)
+            best[ok] = en[ok]
+            U[ok] = dx
+            V[ok] = dy
+    # 平坦块（无纹理）在块匹配里有孔径问题：误差处处为 0，会锁定到第一个搜索偏移。
+    # 剔除这些块，再用邻域填补，避免把常数偏移抹到全图。
+    varA = A.var(axis=(1, 3))
+    thr_var = max(1e-9, (0.01 * float(np.std(ga))) ** 2)
+    valid = varA > thr_var
+    if valid.sum() >= 4:
+        Wv = valid.astype(np.float32)
+        U = np.where(valid, U, 0.0).astype(np.float32)
+        V = np.where(valid, V, 0.0).astype(np.float32)
+        for _ in range(4):                       # 由已知块向外扩散填补
+            Wb = _box3(Wv)
+            Ub = _box3(U * Wv)
+            Vb = _box3(V * Wv)
+            fill = (Wb > 1e-6) & (~valid)
+            U[fill] = Ub[fill] / Wb[fill]
+            V[fill] = Vb[fill] / Wb[fill]
+            Wv[fill] = 1.0
+            valid = valid | fill
+    U = np.repeat(np.repeat(U, B, 0), B, 1)[:H, :W]
+    V = np.repeat(np.repeat(V, B, 0), B, 1)[:H, :W]
+    U = M.gaussian_blur(U, 2.0) * scale
+    V = M.gaussian_blur(V, 2.0) * scale
+    fu = np.repeat(np.repeat(U, scale, 0), scale, 1)
+    fv = np.repeat(np.repeat(V, scale, 0), scale, 1)
+    fu = np.pad(fu, ((0, max(0, a.shape[0] - fu.shape[0])), (0, max(0, a.shape[1] - fu.shape[1]))), mode="edge")
+    fv = np.pad(fv, ((0, max(0, a.shape[0] - fv.shape[0])), (0, max(0, a.shape[1] - fv.shape[1]))), mode="edge")
+    return M.gaussian_blur(fu, 2.0), M.gaussian_blur(fv, 2.0)
 
 
-def refine_shift(ref, img, shift, radius=0.6, step=0.2):
-    """Grid-search a small extra translation (SSD) to correct sub-pixel bias."""
-    H, W = ref.shape[:2]
-    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-    m = (yy > 8) & (yy < H - 8) & (xx > 8) & (xx < W - 8)      # 避开边界
-    best, best_s = None, None
-    for dy in np.arange(-radius, radius + 1e-9, step):
-        for dx in np.arange(-radius, radius + 1e-9, step):
-            cx = np.array([shift[0] + dx, 0.0, 0.0])
-            cy = np.array([shift[1] + dy, 0.0, 0.0])
-            w = warp(img, cx, cy)
-            if w.ndim > 2:
-                d = ((w - ref)[..., 0])[m]
-            else:
-                d = (w - ref)[m]
-            sc = float(np.mean(d * d))
-            if best_s is None or sc < best_s:
-                best_s, best = sc, (shift[0] + dx, shift[1] + dy)
-    return best
-
-
-def warp(img, cx, cy):
-    """Bilinear warp by the affine coefficients from `fit_affine`."""
+def warp(img, u, v):
+    """双线性重采样（flat take）。"""
     H, W = img.shape[:2]
-    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-    sx = -(cx[0] + cx[1] * (xx - W / 2) / W + cx[2] * (yy - H / 2) / H)
-    sy = -(cy[0] + cy[1] * (xx - W / 2) / W + cy[2] * (yy - H / 2) / H)
-    gx = np.clip(xx + sx, 0, W - 1.001)
-    gy = np.clip(yy + sy, 0, H - 1.001)
+    yy, xx = _grid(H, W)
+    gx = np.clip(xx + u, 0, W - 1.001)
+    gy = np.clip(yy + v, 0, H - 1.001)
     x0 = gx.astype(np.int32)
     y0 = gy.astype(np.int32)
-    extra = (None,) * (img.ndim - 2)          # 兼容灰度(H,W)与彩色(H,W,C)
-    fx = (gx - x0).reshape((gx - x0).shape + extra)
-    fy = (gy - y0).reshape((gy - y0).shape + extra)
-    return (img[y0, x0] * (1 - fx) * (1 - fy) + img[y0, x0 + 1] * fx * (1 - fy)
-            + img[y0 + 1, x0] * (1 - fx) * fy + img[y0 + 1, x0 + 1] * fx * fy)
+    fx = gx - x0
+    fy = gy - y0
+    flat = img.reshape(-1, img.shape[2])
+    idx = (y0.ravel() * W + x0.ravel())
+    w00 = ((1 - fx) * (1 - fy)).ravel()[:, None]
+    w01 = (fx * (1 - fy)).ravel()[:, None]
+    w10 = ((1 - fx) * fy).ravel()[:, None]
+    w11 = (fx * fy).ravel()[:, None]
+    out = (flat.take(idx, axis=0) * w00
+           + flat.take(idx + 1, axis=0) * w01
+           + flat.take(idx + W, axis=0) * w10
+           + flat.take(idx + W + 1, axis=0) * w11)
+    return out.reshape(H, W, img.shape[2])
 
 
-def align_stack(frames, ref_index=None, grid=4, refine=True):
-    """Register every frame to one reference frame. Returns (aligned stack, shifts)."""
-    frames = np.asarray(frames, np.float32)
-    n = len(frames)
-    if n == 0:
-        raise ValueError("no frames")
-    ri = n // 2 if ref_index is None else int(ref_index)
-    ref_l = luma(frames[ri])
-    aligned, shifts = [], []
-    for i in range(n):
-        cx, cy = fit_affine(ref_l, luma(frames[i]), grid=grid)
-        if refine and i != ri:
-            dx, dy = refine_shift(ref_l, luma(frames[i]), (float(cx[0]), float(cy[0])))
-            cx = np.array([dx, 0.0, 0.0])
-            cy = np.array([dy, 0.0, 0.0])
-        aligned.append(warp(frames[i], cx, cy))
-        shifts.append((float(cx[0]), float(cy[0])))
-    return np.stack(aligned), np.array(shifts), ri
+def accumulate_weighted(frames, flows, idx, radius=3, sigma=0.04):
+    """沿轨迹对齐 ±radius 帧，残差加权合并。"""
+    H, W = frames[idx].shape[:2]
+    st = [frames[idx]]
+    us = np.zeros((H, W), np.float32)
+    vs = np.zeros_like(us)
+    for k in range(1, radius + 1):
+        j = idx + k
+        if j >= len(frames):
+            break
+        u, v = flows[j - 1]
+        us = us + u
+        vs = vs + v
+        st.append(warp(frames[j], us, vs))
+    us = np.zeros((H, W), np.float32)
+    vs = np.zeros_like(us)
+    for k in range(1, radius + 1):
+        j = idx - k
+        if j < 0:
+            break
+        u, v = flows[j]
+        us = us - u
+        vs = vs - v
+        st.append(warp(frames[j], us, vs))
+    S_ = np.stack(st).astype(np.float32)
+    med = np.median(S_, 0)
+    res = np.abs(S_ - med).mean(-1)
+    w = np.exp(-(res / (2 * sigma)) ** 2)
+    return np.clip((S_ * w[..., None]).sum(0) / (w.sum(0)[..., None] + 1e-6), 0, 1).astype(np.float32)
 
 
-# ---------------------------------------------------------------------- fusion
-def fuse(frames, sigma=None, single_denoise=True, consistency=True, grid=4,
-         polish=False):
-    """Fuse a burst into one image. Returns `(out, info)`.
+# --------------------------------------------------------------- 独立入口
+def fuse(frames, idx=None, radius=None, sigma=None, polish=True, flow_scale=0):
+    """沿轨迹把一段连续帧累积成一张干净图。
 
-    frames : (N, H, W) or (N, H, W, C) float in 0..1
-    sigma  : noise level; estimated from the reference frame when None
-    single_denoise : also denoise the reference frame and use it as the fallback
-    consistency    : blend by temporal variance (moving regions keep the single frame)
+    frames : (N,H,W,3) float 0..1
+    idx    : 参考帧（默认中间帧）
+    radius : 向前/向后各用几帧（默认用满整段）
+    polish : 累积后再走一遍单帧降噪（这是能不能到 40 dB 的关键一步）
     """
-    frames = np.asarray(frames, np.float32)
+    import numpy as _np
+    frames = _np.asarray(frames, _np.float32)
     n = len(frames)
     if n < 2:
-        raise ValueError("need at least 2 frames")
+        raise ValueError("need >= 2 frames")
+    if idx is None:
+        idx = n // 2
+    if radius is None:
+        radius = max(idx, n - 1 - idx)
     if sigma is None:
-        sigma = estimate_sigma(frames[n // 2])
+        y = M.luma(frames[idx])
+        sigma = float(_np.median(_np.abs(y - M.gaussian_blur(y, 1.2))) / 0.6745)
     sigma = max(float(sigma), 1e-4)
 
-    aligned, shifts, ri = align_stack(frames, grid=grid)
-    med = np.median(aligned, 0)
-    res = np.abs(aligned - med)
-    w = np.exp(-(res / (2 * sigma)) ** 2)
-    merged = (aligned * w).sum(0) / (w.sum(0) + 1e-6)
-
-    ref = frames[ri]
-    if single_denoise and _M is not None:
-        single, _ = _M.denoise(ref, sigma=sigma)
-        single = np.clip(single, 0, 1)
+    if flow_scale == 0:
+        flows = [bm_flow_pyramid(frames[i], frames[i + 1]) for i in range(n - 1)]
     else:
-        single = ref
-
-    info = {"frames": int(n), "sigma": float(sigma), "shifts": shifts}
-    if not consistency:
-        info["merged_fraction"] = 1.0
-        return np.clip(merged, 0, 1).astype(np.float32), info
-
-    var = ((aligned - merged) ** 2).mean(0)
-    if var.ndim == 3:
-        var = var.mean(-1)
-    # 绝对阈值：对齐后静止区域的时域方差约为 σ²(1-1/N)，运动区域远大于此。
-    # 用分位数会强行让固定比例的像素回退单帧，静止场景反而变差。
-    thr = 2.0 * sigma ** 2
-    mask = (var < thr).astype(np.float32)
-    mask = gaussian_blur(mask, 2.0)
-    if merged.ndim > 2:                        # 彩色时把掩码扩到通道维
-        mask = mask[..., None]
-    out = mask * merged + (1 - mask) * single
-    info["merged_fraction"] = float(mask.mean())
-    out = np.clip(out, 0, 1)
-    if polish and _M is not None:
-        # 融合已经把噪声压下去 √N，再走一遍单帧降噪继续压低
-        out, _ = _M.denoise(out, sigma=float(sigma) / max(np.sqrt(info["frames"]), 1.0))
-        out = np.clip(out, 0, 1)
-    return out.astype(np.float32), info
+        flows = [bm_flow(frames[i], frames[i + 1], scale=flow_scale) for i in range(n - 1)]
+    out = accumulate_weighted(frames, flows, idx, radius, sigma)
+    info = {"frames": int(n), "radius": int(radius), "sigma": float(sigma), "flow_scale": "pyramid" if flow_scale == 0 else int(flow_scale),
+            "accumulated": int(min(n, idx + radius + 1) - max(0, idx - radius))}
+    if polish:
+        # 累积把噪声降到 σ/√K，再按这个等效噪声走一遍单帧降噪
+        k = max(1, info["accumulated"])
+        d, _ = M.denoise(out, sigma=float(sigma) / _np.sqrt(k))
+        out = _np.clip(d, 0, 1)
+        info["polished"] = True
+    return out.astype(_np.float32), info
 
 
 # ------------------------------------------------------------------ video I/O
@@ -233,7 +218,8 @@ def find_ffmpeg():
 
 
 def read_video_frames(path, t_sec=1.0, count=8, ffmpeg=None):
-    """Read `count` consecutive frames around `t_sec` from a video (float 0..1)."""
+    """Read `count` consecutive frames around `t_sec` (float 0..1)."""
+    import re
     ff = ffmpeg or find_ffmpeg()
     probe = subprocess.run([ff, "-hide_banner", "-i", path], capture_output=True, text=True)
     png = subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-ss", "%.3f" % t_sec,
@@ -243,7 +229,6 @@ def read_video_frames(path, t_sec=1.0, count=8, ffmpeg=None):
         raise RuntimeError("cannot decode video frame")
     H = int.from_bytes(png[20:24], "big")
     W = int.from_bytes(png[16:20], "big")
-    import re
     m = re.search(r"(\d+(?:\.\d+)?)\s+fps", probe.stderr)
     fps = float(m.group(1)) if m else 25.0
     start = max(0.0, t_sec - (count // 2) / fps)
@@ -257,11 +242,10 @@ def read_video_frames(path, t_sec=1.0, count=8, ffmpeg=None):
 
 
 def auto_count(path, t_sec=1.0, ffmpeg=None):
-    """Pick a frame count from inter-frame motion: still scene -> more frames."""
     frames, _ = read_video_frames(path, t_sec, 9, ffmpeg)
     if len(frames) < 3:
         return 3
-    m = float(np.mean([np.abs(luma(frames[i]) - luma(frames[i - 1])).mean()
+    m = float(np.mean([np.abs(M.luma(frames[i]) - M.luma(frames[i - 1])).mean()
                        for i in range(1, len(frames))])) * 255
     for thr, n in ((1.0, 16), (2.0, 12), (4.0, 8), (8.0, 4)):
         if m < thr:
@@ -270,10 +254,21 @@ def auto_count(path, t_sec=1.0, ffmpeg=None):
 
 
 def from_video(path, t_sec=1.0, count=None, **kw):
-    """Convenience: read frames from a video and fuse them."""
     if count is None:
         count = auto_count(path, t_sec)
     frames, fps = read_video_frames(path, t_sec, count)
     out, info = fuse(frames, **kw)
     info["fps"] = fps
     return out, info
+
+def bm_flow_pyramid(a, b, B=8):
+    """Coarse-to-fine flow: ±24 px reach at 1/4 scale, then ±6 px refinement at full scale.
+
+    A single scale cannot do both: at 1/4 resolution a 1-pixel jitter is invisible
+    (measured -0.0 px, i.e. no correction at all), while at full resolution the ±6 px
+    search window cannot follow real camera motion.
+    """
+    u0, v0 = bm_flow(a, b, B=B, R=6, scale=4)
+    b1 = warp(b, u0, v0)
+    u1, v1 = bm_flow(a, b1, B=B, R=6, scale=1)
+    return u0 + u1, v0 + v1
