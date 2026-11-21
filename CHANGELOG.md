@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.5.0 — 2026-11-22
+
+`idm_temporal()` — the three-layer mechanism from the source document
+(`3 时域处理的核心机制.md`), applied to the temporal axis and made block-adaptive:
+
+- 蒸馏: a block counts as a critical point over time only if most frames agree about it
+  (deviation from the temporal median < τσ).
+- 升华: for those blocks take the temporal median (the robust complement).
+- 背景: everything else keeps the frame's own content, so moving detail is never averaged.
+- No transform to invert; the decision is per 8×8 block, which is what makes it completion
+  rather than fusion.
+
+Measured (σ=12 added, 12 frames, ground truth):
+
+| method | PSNR | SSIM |
+|---|---|---|
+| noisy | 29.3 | 0.80 |
+| idm_temporal K=3 / 5 / 9 | 31.2 / 31.9 / 32.0 | 0.87 / 0.89 / 0.89 |
+| temporal median over the *whole* clip | 33.8 | 0.94 |
+| whole-clip median + spatial denoise | 35.0 | 0.96 |
+| **single-frame NPSS** | **36.0** | **0.96** |
+
+Still short of the single-frame denoiser. The reason is structural, not a bug: a K-frame window
+borrows 3–9 observations, while the whole-clip estimators borrow 12, and the spatial prior in
+NPSS is worth about +9 dB on its own — more than any amount of temporal averaging on this clip.
+
 ## 1.4.0 — 2026-11-22
 
 Added `flow_split()` — optical-flow alignment, background subtraction, subject compositing

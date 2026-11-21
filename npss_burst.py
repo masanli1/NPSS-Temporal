@@ -580,3 +580,93 @@ def flow_split(seq, sigma=None, thr_sigma=2.0, dilate=3, subject_denoise=True, t
         out[i] = np.clip(mk * fg + (1 - mk) * bg_i, 0, 1)
     info = {"frames": n, "sigma": float(sigma), "subject_frac": float(masks.mean())}
     return (out[..., 0] if single else out), info
+
+# ------------------------------------------------- temporal completion in DCT
+def complete_dct(aligned, K=3, B=8, stat="median"):
+    """Complete every frame from its temporal neighbours **in the sparse (DCT) domain**.
+
+    Not a subject/background split and not pixel averaging: for each 8x8 block and each DCT
+    coefficient, the K frames are independent observations of the same coefficient. Taking a
+    robust estimate across them cancels noise (which is inconsistent) while keeping structure
+    (which is consistent). Reconstructing from those coefficients avoids the blur that pixel
+    averaging leaves behind.
+
+    aligned: (N,H,W) or (N,H,W,C), already registered to a common frame.
+    """
+    aligned = np.asarray(aligned, np.float32)
+    single = aligned.ndim == 3
+    if single:
+        aligned = aligned[..., None]
+    n, H, W, C = aligned.shape
+    K = max(1, min(int(K), n))
+    h8, w8 = H // B * B, W // B * B
+    ny, nx = h8 // B, w8 // B
+    Ks = _dct_mat(B)
+    half = K // 2
+    out = np.empty_like(aligned)
+    for c in range(C):
+        pad = np.pad(aligned[..., c], ((half, K - 1 - half), (0, 0), (0, 0)), mode="edge")
+        win = np.stack([pad[i:i + K] for i in range(n)], 0)          # (n,K,H,W)
+        win = win[:, :, :h8, :w8]
+        blk = (win.reshape(n, K, ny, B, nx, B).transpose(0, 2, 4, 1, 3, 5)
+               .reshape(n, ny, nx, K, B, B))                        # (n,ny,nx,K,B,B)
+        # 正向：D = Ks · X · Ksᵀ
+        D = np.einsum("ab,nxykbc->nxykac", Ks, blk, optimize=True)
+        D = np.einsum("cd,nxykad->nxykac", Ks, D, optimize=True)
+        Dc = (np.median(D, axis=3) if stat == "median" else np.mean(D, axis=3))[..., None]
+        # 逆向：X = Ksᵀ · D · Ks
+        R = np.einsum("ba,nxykbc->nxykac", Ks, Dc, optimize=True)
+        R = np.einsum("dc,nxykad->nxykac", Ks, R, optimize=True)
+        rec = R[:, :, :, 0].transpose(0, 1, 3, 2, 4).reshape(n, h8, w8)
+        full = np.zeros((n, H, W), np.float32)
+        full[:, :h8, :w8] = rec
+        out[..., c] = full
+    out = np.clip(out, 0, 1).astype(np.float32)
+    return (out[..., 0] if single else out), {"frames": n, "K": K, "stat": stat}
+
+# ------------------------------------- three-layer temporal completion (IDM)
+def idm_temporal(aligned, sigma=None, K=3, B=8, tau=2.0, min_consistent=0.6):
+    """Three-layer temporal completion, block-adaptive (蒸馏 / 升华 / 背景 / 重建).
+
+    * 蒸馏 (distill): keep only blocks whose content is a *critical point* over time —
+      stable enough that the temporal neighbours really do observe the same thing.
+    * 升华 (sublime): inside such blocks, take the temporal median (the robust complement).
+    * 背景 (background): everything else keeps the frame's own content, so moving detail is
+      never averaged away.
+    * 重建: no transform to invert — the decision is made per 8x8 block.
+
+    The point is that this is completion, not fusion: a block is completed only when the
+    neighbours agree about it; otherwise nothing is borrowed at all.
+    """
+    aligned = np.asarray(aligned, np.float32)
+    single = aligned.ndim == 3
+    if single:
+        aligned = aligned[..., None]
+    n, H, W, C = aligned.shape
+    K = max(1, min(int(K), n))
+    if sigma is None:
+        y = M.luma(aligned[n // 2])
+        sigma = float(np.median(np.abs(y - M.gaussian_blur(y, 1.2))) / 0.6745)
+    sigma = max(float(sigma), 1e-4)
+    half = K // 2
+    h8, w8 = H // B * B, W // B * B
+    ny, nx = h8 // B, w8 // B
+    pad = np.pad(aligned, ((half, K - 1 - half), (0, 0), (0, 0), (0, 0)), mode="edge")
+    out = np.empty_like(aligned)
+    for i in range(n):
+        win = pad[i:i + K, :h8, :w8]                       # (K,h8,w8,C)
+        blocks = win.reshape(K, ny, B, nx, B, C).transpose(1, 3, 0, 2, 4, 5)  # (ny,nx,K,B,B,C)
+        med = np.median(blocks, axis=2)                    # 升华：时间中值 (ny,nx,B,B,C)
+        dev = np.abs(blocks - med[:, :, None]).mean(axis=(-1, -2, -3)) / sigma  # (ny,nx,K)
+        agree = (dev < tau).mean(axis=2)                   # (ny,nx) 一致帧比例
+        consistent = agree >= min_consistent
+        own = blocks[:, :, half]                           # 本帧原内容
+        merged = np.where(consistent[:, :, None, None, None], med, own)
+        rec = merged.transpose(0, 2, 1, 3, 4).reshape(h8, w8, C)   # (ny,B,nx,B,C)
+        out[i, :h8, :w8] = rec
+        out[i, h8:] = aligned[i, h8:]
+        out[i, :, w8:] = aligned[i, :, w8:]
+    out = np.clip(out, 0, 1).astype(np.float32)
+    return (out[..., 0] if single else out), {"frames": n, "K": K, "tau": tau,
+                                              "consistent_frac": float(np.mean(consistent))
+                                              if 'consistent' in dir() else 0.0}
