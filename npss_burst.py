@@ -840,3 +840,80 @@ def denoise_temporal(seq, sigma=None, K=3, preset="balanced", k0=3.0, k0_ac=6.0)
         raise ValueError(f"preset must be one of {list(PRESETS)}")
     kw = dict(PRESETS[preset])
     return temporal_3d_fast(seq, sigma=sigma, K=K, k0=k0, k0_ac=k0_ac, **kw)
+
+# ------------------------------------------------------------------ parallel
+def _frame_range(seq, lo, hi, sigma, K, blocks, phases, k0, k0_ac):
+    """Process frames [lo,hi) of `seq` — the unit of parallel work."""
+    n = len(seq)
+    T = int(max(1, min(K, n)))
+    half = T // 2
+    Kt = _dct_mat(T).astype(np.float32)
+    H, W, C = seq.shape[1:]
+    out = np.empty((hi - lo,) + seq.shape[1:], np.float32)
+    for j, i in enumerate(range(lo, hi)):
+        a, b = max(0, i - half), min(n, i + half + 1)
+        idx = list(range(a, b))
+        while len(idx) < T:
+            idx.insert(0, idx[0]) if a == 0 else idx.append(idx[-1])
+        win = seq[idx]
+        acc = np.zeros((H, W, C), np.float64)
+        cnt = 0
+        for B in blocks:
+            Ks = _dct_mat(B).astype(np.float32)
+            KsT = Ks.T.copy()
+            # 一次性 pad 到四周各 B，再按相位切片 —— 原来每个相位都要重新 pad 一次 57MB
+            padded = np.pad(win, ((0, 0), (B, B), (B, B), (0, 0)), mode="symmetric")
+            for (sy, sx) in _phases(B, phases):
+                p4 = padded[:, B - sy:B - sy + H + 2 * B, B - sx:B - sx + W + 2 * B]
+                ny, nx = H // B, W // B
+                blk = (p4[:, :ny * B, :nx * B].reshape(T, ny, B, nx, B, C)
+                       .transpose(1, 3, 5, 0, 2, 4))
+                F = np.matmul(np.matmul(Ks, blk), KsT)
+                Ft = F.transpose(0, 1, 2, 4, 5, 3)
+                shp = Ft.shape
+                Fc = Ft.reshape(-1, T) @ Kt.T
+                thr = np.full((T,), k0 * sigma, np.float32)
+                if k0_ac is not None:
+                    thr[1:] = k0_ac * sigma
+                g = (np.abs(Fc) > thr[None, :]).reshape(shp)
+                g[..., 0, 0, :] = True
+                F = ((Fc.reshape(shp) * g).reshape(-1, T) @ Kt).reshape(shp).transpose(0, 1, 2, 5, 3, 4)
+                F = np.matmul(KsT, np.matmul(F, Ks))
+                rec = F[:, :, :, half].transpose(0, 3, 1, 4, 2).reshape(ny * B, nx * B, C)
+                full = np.zeros((H + 2 * B, W + 2 * B, C), np.float32)
+                full[:rec.shape[0], :rec.shape[1]] = rec
+                acc += full[sy:sy + H, sx:sx + W]
+                cnt += 1
+        out[j] = np.clip(acc / max(cnt, 1), 0, 1)
+    return out
+
+
+def denoise_temporal_parallel(seq, sigma=None, K=3, preset="balanced", k0=3.0, k0_ac=6.0,
+                              workers=None, chunk=None):
+    """`denoise_temporal` split across processes. Frames are independent, so this scales
+    almost linearly; each worker only needs its own K-frame window."""
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+    seq = np.asarray(seq, np.float32)
+    n = len(seq)
+    if sigma is None:
+        y = M.luma(seq[n // 2])
+        sigma = float(np.median(np.abs(y - M.gaussian_blur(y, 1.2))) / 0.6745)
+    sigma = max(float(sigma), 1e-4)
+    kw = dict(PRESETS[preset]) if isinstance(preset, str) else dict(preset)
+    workers = int(workers or max(1, (os.cpu_count() or 2) - 1))
+    chunk = int(chunk or max(1, n // (workers * 2)))
+    ranges = [(lo, min(n, lo + chunk)) for lo in range(0, n, chunk)]
+    if workers <= 1 or len(ranges) <= 1:
+        return _frame_range(seq, 0, n, sigma, K, kw["blocks"], kw["phases"], k0, k0_ac), \
+               {"frames": n, "workers": 1, "preset": preset}
+    out = np.empty_like(seq)
+    import multiprocessing as mp
+    ctx = mp.get_context("fork") if hasattr(mp, "get_context") else None
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+        futs = {ex.submit(_frame_range, seq, lo, hi, sigma, K,
+                          kw["blocks"], kw["phases"], k0, k0_ac): (lo, hi) for lo, hi in ranges}
+        for f in futs:
+            lo, hi = futs[f]
+            out[lo:hi] = f.result()
+    return out, {"frames": n, "workers": workers, "preset": preset}

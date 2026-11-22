@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.8.0 — 2026-11-22
+
+`denoise_temporal_parallel()` — frames are independent, so the work splits across processes
+(fork, shared memory via copy-on-write). Measured on 12 frames (1088×1440):
+
+| preset | workers | s/frame | total |
+|---|---|---|---|
+| fast | 1 | 1.23 | 15 s |
+| **fast** | **4** | **0.82** | **10 s** |
+| balanced | 4 | 1.67 | 20 s |
+
+Speedup is 1.5× at 4 workers on a machine already carrying load 4.6; 8 workers is slower
+(contention). The presets remain the strongest lever: `fast` at 1.3 s/frame versus the
+original multi-scale at 31.6 s/frame is a 24× gain.
+
+### Two findings from this round
+
+- **Batching the phases into one big matmul is slower** (0.82×) — the concatenate copy costs
+  more than the BLAS efficiency gains at this size.
+- **Padding once per scale instead of once per phase** made no measurable difference; profiling
+  puts the cost in the block-transform data movement, not in the padding.
+
+### Why sigma matters more than it looks
+
+Alignment is bilinear, and that resampling lowers the noise: a frame synthesised at σ=12/255
+measures **8.3/255** after alignment. Passing the *pre*-alignment σ (12) over-thresholds and
+costs 3 dB (32.91 vs 35.89). Auto-estimation on the aligned frames is therefore the right
+default for this pipeline.
+
 ## 1.7.0 — 2026-11-22
 
 Temporal 3D is now **3.4× faster** (and up to 24× with the fast preset) at identical output.
